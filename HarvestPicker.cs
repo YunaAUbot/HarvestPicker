@@ -1,21 +1,17 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Threading.Tasks;
 using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
-using HarvestPicker.Api.Response;
-using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using SharpDX;
 using Vector2 = System.Numerics.Vector2;
 using static MoreLinq.Extensions.PermutationsExtension;
-using System.Web;
 using ExileCore.Shared.Helpers;
 
 namespace HarvestPicker;
@@ -32,19 +28,19 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
 {
     public override bool Initialise()
     {
-        _pricesGetter = LoadPricesFromDisk(false);
-        Settings.ReloadPrices.OnPressed = () => { _pricesGetter = LoadPricesFromDisk(true); };
+        _pricesGetter = LoadPricesFromNinjaCache();
+        Settings.ReloadPrices.OnPressed = () => { _pricesGetter = LoadPricesFromNinjaCache(); };
         return true;
     }
 
-    private readonly Stopwatch _lastRetrieveStopwatch = new Stopwatch();
     private Task _pricesGetter;
     private HarvestPrices _prices;
+    private string _loadedCachePath;
+    private DateTime _loadedCacheWriteTimeUtc;
     private List<((Entity, double), (Entity, double))> _irrigatorPairs;
     private List<Entity> _cropRotationPath;
     private double _cropRotationValue;
     private HashSet<(SeedData, SeedData)> _lastSeedData;
-    private string CachePath => Path.Join(ConfigDirectory, "pricecache.json");
 
     public override void AreaChange(AreaInstance area)
     {
@@ -52,28 +48,6 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
         _cropRotationPath = null;
         _cropRotationValue = 0;
         _irrigatorPairs = [];
-        Settings.League.Values = (Settings.League.Values ?? []).Union([PlayerLeague, "Standard", "Hardcore"]).Where(x => x != null).ToList();
-    }
-
-    private string PlayerLeague
-    {
-        get
-        {
-            var playerLeague = GameController.IngameState.ServerData.League;
-            if (string.IsNullOrWhiteSpace(playerLeague))
-            {
-                playerLeague = null;
-            }
-            else
-            {
-                if (playerLeague.StartsWith("SSF "))
-                {
-                    playerLeague = playerLeague["SSF ".Length..];
-                }
-            }
-
-            return playerLeague;
-        }
     }
 
     private HarvestPrices Prices
@@ -85,105 +59,84 @@ public class HarvestPicker : BaseSettingsPlugin<HarvestPickerSettings>
                 _pricesGetter = null;
             }
 
-            if ((!_lastRetrieveStopwatch.IsRunning ||
-                 _lastRetrieveStopwatch.Elapsed >= TimeSpan.FromMinutes(Settings.PriceRefreshPeriodMinutes)) &&
-                _pricesGetter == null)
+            if (_pricesGetter == null)
             {
-                _pricesGetter = FetchPrices();
-                _lastRetrieveStopwatch.Reset();
+                var cachePath = GetConfiguredNinjaCurrencyCachePath();
+                var cacheWriteTimeUtc = cachePath != null && File.Exists(cachePath)
+                    ? File.GetLastWriteTimeUtc(cachePath)
+                    : DateTime.MinValue;
+                if (_prices == null || cachePath != _loadedCachePath || cacheWriteTimeUtc > _loadedCacheWriteTimeUtc)
+                {
+                    _pricesGetter = LoadPricesFromNinjaCache();
+                }
             }
 
             return _prices;
         }
     }
 
-    private async Task FetchPrices()
+    private string GetConfiguredNinjaCurrencyCachePath()
     {
-        await Task.Yield();
         try
         {
-            Log("Starting data update");
-            using var client = new HttpClient();
+            var settingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config", "global", "Ninja_Price.Main_settings.json");
+            if (!File.Exists(settingsPath))
+                return null;
 
-            var query = HttpUtility.ParseQueryString("");
-            query["league"] = Settings.League.Value;
-            query["type"] = "Currency";
+            var settings = JObject.Parse(File.ReadAllText(settingsPath));
+            var league = settings["DataSourceSettings"]?["League"]?["Value"]?.Value<string>();
+            if (string.IsNullOrWhiteSpace(league))
+                return null;
 
-            UriBuilder builder = new UriBuilder();
-            builder.Path = "/api/data/currencyoverview";
-            builder.Host = "poe.ninja";
-            builder.Scheme = "https";
-            builder.Query = query.ToString();
-
-            string uri = builder.ToString();
-
-            var request = client.GetAsync(uri);
-            Log($"Fetching data from poe.ninja with url: {uri}");
-
-            var response = await request;
-            response.EnsureSuccessStatusCode();
-
-            var str = await response.Content.ReadAsStringAsync();
-            var responseObject = JsonConvert.DeserializeObject<PoeNinjaCurrencyResponse>(str);
-
-            var dataMap = responseObject.Lines.ToDictionary(x => x.CurrencyTypeName, x => responseObject.FindLine(x)?.ChaosEquivalent);
-            if (dataMap.Any(x => x.Value is 0 or null) || dataMap.Count < 4)
-            {
-                Log($"Some data is missing: {str}");
-            }
-
-            _prices = new HarvestPrices
-            {
-                BlueJuiceValue = dataMap.GetValueOrDefault("Primal Crystallised Lifeforce") ?? 0,
-                YellowJuiceValue = dataMap.GetValueOrDefault("Vivid Crystallised Lifeforce") ?? 0,
-                PurpleJuiceValue = dataMap.GetValueOrDefault("Wild Crystallised Lifeforce") ?? 0,
-                WhiteJuiceValue = dataMap.GetValueOrDefault("Sacred Crystallised Lifeforce") ?? 0,
-            };
-            await File.WriteAllTextAsync(CachePath, JsonConvert.SerializeObject(_prices));
-            Log("Data update complete");
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Plugins", "Temp", "Get-Chaos-Value", "NinjaData", league, "Currency2.json");
         }
-        catch (Exception ex)
+        catch
         {
-            DebugWindow.LogError(ex.ToString());
-        }
-        finally
-        {
-            _lastRetrieveStopwatch.Restart();
+            return null;
         }
     }
 
-    private async Task LoadPricesFromDisk(bool force)
+    private async Task LoadPricesFromNinjaCache()
     {
         await Task.Yield();
         try
         {
-            Log("Loading data from disk");
-            var cachePath = CachePath;
-            if (File.Exists(cachePath))
+            var cachePath = GetConfiguredNinjaCurrencyCachePath();
+            if (cachePath == null || !File.Exists(cachePath))
+                throw new FileNotFoundException("The configured Ninja Price currency cache was not found.", cachePath);
+
+            var root = JObject.Parse(await File.ReadAllTextAsync(cachePath));
+            var core = root["core"];
+            var chaosMultiplier = string.Equals(core?["primary"]?.Value<string>(), "chaos", StringComparison.OrdinalIgnoreCase)
+                ? 1d
+                : core?["rates"]?["chaos"]?.Value<double?>()
+                  ?? throw new InvalidDataException("The Ninja Price cache does not contain a Chaos conversion rate.");
+            var valuesById = (root["lines"] as JArray ?? [])
+                .OfType<JObject>()
+                .Where(x => !string.IsNullOrWhiteSpace(x["id"]?.Value<string>()))
+                .ToDictionary(
+                    x => x["id"].Value<string>(),
+                    x => (x["primaryValue"]?.Value<double?>() ?? 0d) * chaosMultiplier,
+                    StringComparer.OrdinalIgnoreCase);
+
+            double RequiredValue(string id) => valuesById.TryGetValue(id, out var value) && value > 0d
+                ? value
+                : throw new InvalidDataException($"Ninja Price has no positive value for '{id}'.");
+
+            _prices = new HarvestPrices
             {
-                _prices = JsonConvert.DeserializeObject<HarvestPrices>(await File.ReadAllTextAsync(cachePath));
-                Log("Data loaded from disk");
-                if (force)
-                {
-                    _lastRetrieveStopwatch.Reset();
-                }
-                else
-                {
-                    if (DateTime.UtcNow - File.GetLastWriteTimeUtc(cachePath) < TimeSpan.FromMinutes(Settings.PriceRefreshPeriodMinutes))
-                    {
-                        _lastRetrieveStopwatch.Restart();
-                    }
-                }
-            }
-            else
-            {
-                Log("Cached data doesn't exist");
-                _lastRetrieveStopwatch.Reset();
-            }
+                BlueJuiceValue = RequiredValue("primal-lifeforce"),
+                YellowJuiceValue = RequiredValue("vivid-lifeforce"),
+                PurpleJuiceValue = RequiredValue("wild-lifeforce"),
+                WhiteJuiceValue = RequiredValue("sacred-lifeforce"),
+            };
+            _loadedCachePath = cachePath;
+            _loadedCacheWriteTimeUtc = File.GetLastWriteTimeUtc(cachePath);
+            Log($"Loaded Lifeforce prices from Ninja Price cache: {Path.GetFileName(Path.GetDirectoryName(cachePath))}");
         }
         catch (Exception ex)
         {
-            DebugWindow.LogError(ex.ToString());
+            DebugWindow.LogError($"[HarvestPicker] Unable to load Ninja Price cache: {ex}");
         }
     }
 

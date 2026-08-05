@@ -10,9 +10,6 @@ public class HarvestPickerSettings : ISettings
     //Mandatory setting to allow enabling/disabling your plugin
     public ToggleNode Enable { get; set; } = new ToggleNode(false);
 
-    public ListNode League { get; set; } = new ListNode() { Value = "Necropolis" };
-    public RangeNode<int> PriceRefreshPeriodMinutes { get; set; } = new RangeNode<int>(15, 5, 60);
-
     [JsonIgnore]
     public ButtonNode ReloadPrices { get; set; } = new ButtonNode();
     public ToggleNode DrawRotationOnMap { get; set; } = new ToggleNode(true);
